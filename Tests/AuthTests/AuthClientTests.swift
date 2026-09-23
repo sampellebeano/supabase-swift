@@ -100,6 +100,8 @@ final class AuthClientTests: XCTestCase {
 
     let (initialRefreshEntered, initialRefreshEnteredContinuation) = AsyncStream<Void>.makeStream()
     let (releaseInitialRefresh, releaseInitialRefreshContinuation) = AsyncStream<Void>.makeStream()
+    let (initialRefreshFinished, initialRefreshFinishedContinuation) = AsyncStream<Void>
+      .makeStream()
     let refreshTokens = LockIsolated([String]())
 
     let fetch: AuthClient.FetchHandler = { request in
@@ -145,6 +147,8 @@ final class AuthClientTests: XCTestCase {
       initialRefreshEnteredContinuation.yield(())
       _ = await releaseInitialRefresh.first(where: { _ in true })
       await liveSessionManager.refreshCurrentSessionIfExpired()
+      initialRefreshFinishedContinuation.yield(())
+      initialRefreshFinishedContinuation.finish()
     }
     Dependencies[sut.clientID].sessionManager = delayedSessionManager
 
@@ -159,7 +163,7 @@ final class AuthClientTests: XCTestCase {
 
     releaseInitialRefreshContinuation.yield(())
     releaseInitialRefreshContinuation.finish()
-    await Task.megaYield()
+    _ = await initialRefreshFinished.first(where: { _ in true })
 
     XCTAssertEqual(
       refreshTokens.value,
