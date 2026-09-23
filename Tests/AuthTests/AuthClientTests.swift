@@ -85,6 +85,91 @@ final class AuthClientTests: XCTestCase {
     expectNoDifference(stateChange?.session, session)
   }
 
+  func testDelayedInitialRefreshCannotOverwriteASessionInstalledByCodeExchange() async throws {
+    var expiredSessionA = Session.expiredSession
+    expiredSessionA.accessToken = "synthetic-account-a-access"
+    expiredSessionA.refreshToken = "synthetic-account-a-refresh"
+    expiredSessionA.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+    let sessionA = expiredSessionA
+
+    var recoverySessionB = Session.validSession
+    recoverySessionB.accessToken = "synthetic-recovery-b-access"
+    recoverySessionB.refreshToken = "synthetic-recovery-b-refresh"
+    recoverySessionB.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
+    let sessionB = recoverySessionB
+
+    var refreshedSessionA = Session.validSession
+    refreshedSessionA.accessToken = "synthetic-refreshed-a-access"
+    refreshedSessionA.refreshToken = "synthetic-refreshed-a-refresh"
+    refreshedSessionA.user.id = sessionA.user.id
+    let responseSessionA = refreshedSessionA
+
+    let refreshTokenA = sessionA.refreshToken
+    let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+    let refreshTokens = LockIsolated([String]())
+
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      let grantType = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?
+        .first(where: { $0.name == "grant_type" })?
+        .value
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+
+      switch grantType {
+      case "refresh_token":
+        struct RefreshRequest: Decodable {
+          let refreshToken: String
+        }
+
+        let refreshToken = try AuthClient.Configuration.jsonDecoder.decode(
+          RefreshRequest.self,
+          from: request.httpBody ?? Data()
+        ).refreshToken
+        refreshTokens.withValue { $0.append(refreshToken) }
+        refreshRequestStartedContinuation.yield(())
+        _ = await releaseRefreshResponse.first(where: { _ in true })
+        return (try AuthClient.Configuration.jsonEncoder.encode(responseSessionA), response)
+      case "pkce":
+        return (try AuthClient.Configuration.jsonEncoder.encode(sessionB), response)
+      default:
+        throw URLError(.badServerResponse)
+      }
+    }
+
+    let sut = makeSUT(emitLocalSessionAsInitialSession: true, fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(sessionA)
+
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    _ = await refreshRequestStarted.first(where: { _ in true })
+    _ = try await sut.exchangeCodeForSession(authCode: "synthetic-recovery-code")
+
+    releaseRefreshResponseContinuation.yield(())
+    releaseRefreshResponseContinuation.finish()
+    await Task.megaYield()
+
+    XCTAssertEqual(refreshTokens.value, [refreshTokenA])
+    XCTAssertEqual(Dependencies[sut.clientID].sessionStorage.get()?.refreshToken, sessionB.refreshToken)
+    XCTAssertFalse(
+      events.value.contains { $0.0 == .tokenRefreshed && $0.1?.user.id == sessionA.user.id },
+      "Delayed initial-session work must not publish an old session after code exchange installs B."
+    )
+  }
+
   func testSignOut() async throws {
     let sut = makeSUT()
 
@@ -2680,7 +2765,9 @@ final class AuthClientTests: XCTestCase {
   }
 
   private func makeSUT(
-    flowType: AuthFlowType = .pkce, emitLocalSessionAsInitialSession: Bool = false
+    flowType: AuthFlowType = .pkce,
+    emitLocalSessionAsInitialSession: Bool = false,
+    fetch: AuthClient.FetchHandler? = nil
   ) -> AuthClient {
     let sessionConfiguration = URLSessionConfiguration.default
     sessionConfiguration.protocolClasses = [MockingURLProtocol.self]
@@ -2699,9 +2786,7 @@ final class AuthClientTests: XCTestCase {
       localStorage: storage,
       logger: nil,
       encoder: encoder,
-      fetch: { request in
-        try await session.data(for: request)
-      },
+      fetch: fetch ?? { request in try await session.data(for: request) },
       emitLocalSessionAsInitialSession: emitLocalSessionAsInitialSession
     )
 

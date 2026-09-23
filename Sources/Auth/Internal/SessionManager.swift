@@ -3,7 +3,10 @@ import Foundation
 struct SessionManager: Sendable {
   var session: @Sendable () async throws -> Session
   var refreshSession: @Sendable (_ refreshToken: String) async throws -> Session
+  var refreshCurrentSession: @Sendable () async throws -> Session
+  var refreshCurrentSessionIfExpired: @Sendable () async -> Void
   var update: @Sendable (_ session: Session) async -> Void
+  var updateUser: @Sendable (_ session: Session) async -> Void
   var remove: @Sendable () async -> Void
 
   var startAutoRefresh: @Sendable () async -> Void
@@ -16,7 +19,10 @@ extension SessionManager {
     return Self(
       session: { try await instance.session() },
       refreshSession: { try await instance.refreshSession($0) },
+      refreshCurrentSession: { try await instance.refreshCurrentSession() },
+      refreshCurrentSessionIfExpired: { await instance.refreshCurrentSessionIfExpired() },
       update: { await instance.update($0) },
+      updateUser: { await instance.updateUser($0) },
       remove: { await instance.remove() },
       startAutoRefresh: { await instance.startAutoRefreshToken() },
       stopAutoRefresh: { await instance.stopAutoRefreshToken() }
@@ -31,13 +37,24 @@ private actor LiveSessionManager {
   private var logger: (any SupabaseLogger)? { Dependencies[clientID].logger }
   private var api: APIClient { Dependencies[clientID].api }
 
-  private var inFlightRefreshTask: Task<Session, any Error>?
+  // A replacement/removal invalidates all work captured at an earlier epoch.
+  // Only the current (epoch, operationID) may commit refresh side effects.
+  // A defer clears the in-flight slot only when it still owns that slot.
+  private var sessionEpoch: UInt64 = 0
+  private var inFlightRefresh: RefreshOperation?
   private var startAutoRefreshTokenTask: Task<Void, Never>?
 
   let clientID: AuthClientID
 
   init(clientID: AuthClientID) {
     self.clientID = clientID
+  }
+
+  private struct RefreshOperation {
+    let operationID: UUID
+    let epoch: UInt64
+    let refreshToken: String
+    let task: Task<Session, any Error>
   }
 
   func session() async throws -> Session {
@@ -64,49 +81,93 @@ private actor LiveSessionManager {
       ]
     ) {
       try await trace(using: logger) {
-        if let inFlightRefreshTask {
+        if let inFlightRefresh,
+          inFlightRefresh.epoch == sessionEpoch,
+          inFlightRefresh.refreshToken == refreshToken
+        {
           logger?.debug("Refresh already in flight")
-          return try await inFlightRefreshTask.value
+          return try await inFlightRefresh.task.value
         }
 
-        inFlightRefreshTask = Task {
+        let operationID = UUID()
+        let epoch = sessionEpoch
+        let refreshTask = Task {
           logger?.debug("Refresh task started")
 
           defer {
-            inFlightRefreshTask = nil
+            clearRefreshOperationIfOwned(operationID: operationID, epoch: epoch)
             logger?.debug("Refresh task ended")
           }
 
-          let session = try await api.execute(
-            HTTPRequest(
-              url: configuration.url.appendingPathComponent("token"),
-              method: .post,
-              query: [
-                URLQueryItem(name: "grant_type", value: "refresh_token")
-              ],
-              body: configuration.encoder.encode(
-                UserCredentials(refreshToken: refreshToken)
-              )
+          do {
+            let session = try await api.execute(
+              HTTPRequest(
+                url: configuration.url.appendingPathComponent("token"),
+                method: .post,
+                query: [
+                  URLQueryItem(name: "grant_type", value: "refresh_token")
+                ],
+                body: configuration.encoder.encode(
+                  UserCredentials(refreshToken: refreshToken)
+                )
+              ),
+              sessionCleanupPolicy: .refreshOwner
             )
-          )
-          .decoded(as: Session.self, decoder: configuration.decoder)
+            .decoded(as: Session.self, decoder: configuration.decoder)
 
-          update(session)
-          eventEmitter.emit(.tokenRefreshed, session: session)
-
-          return session
+            return try commitRefresh(
+              session,
+              operationID: operationID,
+              epoch: epoch
+            )
+          } catch {
+            return try resolveRefreshFailure(
+              error,
+              operationID: operationID,
+              epoch: epoch
+            )
+          }
         }
 
-        return try await inFlightRefreshTask!.value
+        inFlightRefresh = RefreshOperation(
+          operationID: operationID,
+          epoch: epoch,
+          refreshToken: refreshToken,
+          task: refreshTask
+        )
+
+        return try await refreshTask.value
       }
     }
   }
 
+  func refreshCurrentSession() async throws -> Session {
+    guard let currentSession = sessionStorage.get() else {
+      throw AuthError.sessionMissing
+    }
+
+    return try await refreshSession(currentSession.refreshToken)
+  }
+
+  func refreshCurrentSessionIfExpired() async {
+    guard let currentSession = sessionStorage.get(), currentSession.isExpired else {
+      return
+    }
+
+    _ = try? await refreshSession(currentSession.refreshToken)
+  }
+
   func update(_ session: Session) {
+    invalidateRefreshOperations()
+    sessionStorage.store(session)
+  }
+
+  func updateUser(_ session: Session) {
     sessionStorage.store(session)
   }
 
   func remove() {
+    invalidateRefreshOperations()
     sessionStorage.delete()
   }
 
@@ -145,5 +206,59 @@ private actor LiveSessionManager {
         _ = try? await refreshSession(session.refreshToken)
       }
     }
+  }
+
+  private func commitRefresh(
+    _ session: Session,
+    operationID: UUID,
+    epoch: UInt64
+  ) throws -> Session {
+    guard ownsRefreshOperation(operationID: operationID, epoch: epoch) else {
+      throw CancellationError()
+    }
+
+    sessionStorage.store(session)
+    eventEmitter.emit(.tokenRefreshed, session: session)
+    return session
+  }
+
+  private func resolveRefreshFailure(
+    _ error: any Error,
+    operationID: UUID,
+    epoch: UInt64
+  ) throws -> Session {
+    guard ownsRefreshOperation(operationID: operationID, epoch: epoch) else {
+      throw CancellationError()
+    }
+
+    guard error as? AuthError == .sessionMissing else {
+      throw error
+    }
+
+    invalidateRefreshOperations()
+    sessionStorage.delete()
+    eventEmitter.emit(.signedOut, session: nil)
+    throw error
+  }
+
+  private func ownsRefreshOperation(operationID: UUID, epoch: UInt64) -> Bool {
+    guard sessionEpoch == epoch, let inFlightRefresh else {
+      return false
+    }
+
+    return inFlightRefresh.operationID == operationID && inFlightRefresh.epoch == epoch
+  }
+
+  private func clearRefreshOperationIfOwned(operationID: UUID, epoch: UInt64) {
+    guard ownsRefreshOperation(operationID: operationID, epoch: epoch) else {
+      return
+    }
+
+    inFlightRefresh = nil
+  }
+
+  private func invalidateRefreshOperations() {
+    sessionEpoch &+= 1
+    inFlightRefresh = nil
   }
 }

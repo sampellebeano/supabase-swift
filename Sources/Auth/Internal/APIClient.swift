@@ -21,6 +21,11 @@ extension HTTPClient {
 }
 
 struct APIClient: Sendable {
+  enum SessionCleanupPolicy: Sendable {
+    case immediate
+    case refreshOwner
+  }
+
   let clientID: AuthClientID
 
   var configuration: AuthClient.Configuration {
@@ -47,7 +52,10 @@ struct APIClient: Sendable {
     .refreshTokenAlreadyUsed,
   ]
 
-  func execute(_ request: Helpers.HTTPRequest) async throws -> Helpers.HTTPResponse {
+  func execute(
+    _ request: Helpers.HTTPRequest,
+    sessionCleanupPolicy: SessionCleanupPolicy = .immediate
+  ) async throws -> Helpers.HTTPResponse {
     var request = request
     request.headers = HTTPFields(configuration.headers).merging(with: request.headers)
 
@@ -58,7 +66,7 @@ struct APIClient: Sendable {
     let response = try await http.send(request)
 
     guard 200..<300 ~= response.statusCode else {
-      throw await handleError(response: response)
+      throw await handleError(response: response, sessionCleanupPolicy: sessionCleanupPolicy)
     }
 
     return response
@@ -78,7 +86,10 @@ struct APIClient: Sendable {
     return try await execute(request)
   }
 
-  func handleError(response: Helpers.HTTPResponse) async -> AuthError {
+  func handleError(
+    response: Helpers.HTTPResponse,
+    sessionCleanupPolicy: SessionCleanupPolicy = .immediate
+  ) async -> AuthError {
     guard
       let error = try? response.decoded(
         as: _RawAPIErrorResponse.self,
@@ -118,8 +129,10 @@ struct APIClient: Sendable {
       // The `session_id` inside the JWT does not correspond to a row in the
       // `sessions` table. This usually means the user has signed out, has been
       // deleted, or their session has somehow been terminated.
-      await sessionManager.remove()
-      eventEmitter.emit(.signedOut, session: nil)
+      if case .immediate = sessionCleanupPolicy {
+        await sessionManager.remove()
+        eventEmitter.emit(.signedOut, session: nil)
+      }
       return .sessionMissing
     } else {
       return .api(

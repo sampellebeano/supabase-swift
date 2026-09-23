@@ -1206,7 +1206,7 @@ public actor AuthClient {
       )
     ).decoded(as: User.self, decoder: configuration.decoder)
     session.user = updatedUser
-    await sessionManager.update(session)
+    await sessionManager.updateUser(session)
     eventEmitter.emit(.userUpdated, session: session)
     return updatedUser
   }
@@ -1381,11 +1381,11 @@ public actor AuthClient {
   /// - Returns: A new session.
   @discardableResult
   public func refreshSession(refreshToken: String? = nil) async throws -> Session {
-    guard let refreshToken = refreshToken ?? currentSession?.refreshToken else {
-      throw AuthError.sessionMissing
+    if let refreshToken {
+      return try await sessionManager.refreshSession(refreshToken)
     }
 
-    return try await sessionManager.refreshSession(refreshToken)
+    return try await sessionManager.refreshCurrentSession()
   }
 
   /// Starts an auto-refresh process in the background. The session is checked every few seconds. Close to the time of expiration a process is started to refresh the session. If refreshing fails it will be retried for as long as necessary.
@@ -1410,10 +1410,8 @@ public actor AuthClient {
       eventEmitter.emit(.initialSession, session: currentSession, token: token)
 
       Task {
-        if currentSession.isExpired {
-          _ = try? await sessionManager.refreshSession(currentSession.refreshToken)
-          // No need to emit `tokenRefreshed` nor `signOut` event since the `refreshSession` does it already.
-        }
+        await sessionManager.refreshCurrentSessionIfExpired()
+        // No need to emit `tokenRefreshed` nor `signOut` event since the refresh manager does it.
       }
     } else {
       let session = try? await session
