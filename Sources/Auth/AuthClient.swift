@@ -1189,26 +1189,35 @@ public actor AuthClient {
       user.codeChallengeMethod = codeChallengeMethod
     }
 
-    var session = try await sessionManager.session()
-    let updatedUser = try await api.authorizedExecute(
-      .init(
-        url: configuration.url.appendingPathComponent("user"),
-        method: .put,
-        query: [
-          (redirectTo ?? configuration.redirectToURL).map {
-            URLQueryItem(
-              name: "redirect_to",
-              value: $0.absoluteString
-            )
-          }
-        ].compactMap { $0 },
-        body: configuration.encoder.encode(user)
+    let userUpdateContext = try await sessionManager.userUpdateContext()
+    var request = HTTPRequest(
+      url: configuration.url.appendingPathComponent("user"),
+      method: .put,
+      query: [
+        (redirectTo ?? configuration.redirectToURL).map {
+          URLQueryItem(
+            name: "redirect_to",
+            value: $0.absoluteString
+          )
+        }
+      ].compactMap { $0 },
+      body: try configuration.encoder.encode(user)
+    )
+    request.headers[.authorization] = "Bearer \(userUpdateContext.session.accessToken)"
+    do {
+      let updatedUser = try await api.execute(
+        request,
+        sessionCleanupPolicy: .deferredToSessionOwner
       )
-    ).decoded(as: User.self, decoder: configuration.decoder)
-    session.user = updatedUser
-    await sessionManager.updateUser(session)
-    eventEmitter.emit(.userUpdated, session: session)
-    return updatedUser
+      .decoded(as: User.self, decoder: configuration.decoder)
+      _ = try await sessionManager.commitUserUpdate(updatedUser, userUpdateContext)
+      return updatedUser
+    } catch {
+      if error as? AuthError == .sessionMissing {
+        _ = await sessionManager.removeIfUserUpdateOwned(userUpdateContext)
+      }
+      throw error
+    }
   }
 
   /// Gets all the identities linked to a user.

@@ -98,15 +98,8 @@ final class AuthClientTests: XCTestCase {
     recoverySessionB.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
     let sessionB = recoverySessionB
 
-    var refreshedSessionA = Session.validSession
-    refreshedSessionA.accessToken = "synthetic-refreshed-a-access"
-    refreshedSessionA.refreshToken = "synthetic-refreshed-a-refresh"
-    refreshedSessionA.user.id = sessionA.user.id
-    let responseSessionA = refreshedSessionA
-
-    let refreshTokenA = sessionA.refreshToken
-    let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
-    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+    let (initialRefreshEntered, initialRefreshEnteredContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseInitialRefresh, releaseInitialRefreshContinuation) = AsyncStream<Void>.makeStream()
     let refreshTokens = LockIsolated([String]())
 
     let fetch: AuthClient.FetchHandler = { request in
@@ -136,9 +129,7 @@ final class AuthClientTests: XCTestCase {
           from: request.httpBody ?? Data()
         ).refreshToken
         refreshTokens.withValue { $0.append(refreshToken) }
-        refreshRequestStartedContinuation.yield(())
-        _ = await releaseRefreshResponse.first(where: { _ in true })
-        return (try AuthClient.Configuration.jsonEncoder.encode(responseSessionA), response)
+        throw URLError(.badServerResponse)
       case "pkce":
         return (try AuthClient.Configuration.jsonEncoder.encode(sessionB), response)
       default:
@@ -148,6 +139,14 @@ final class AuthClientTests: XCTestCase {
 
     let sut = makeSUT(emitLocalSessionAsInitialSession: true, fetch: fetch)
     Dependencies[sut.clientID].sessionStorage.store(sessionA)
+    let liveSessionManager = Dependencies[sut.clientID].sessionManager
+    var delayedSessionManager = liveSessionManager
+    delayedSessionManager.refreshCurrentSessionIfExpired = {
+      initialRefreshEnteredContinuation.yield(())
+      _ = await releaseInitialRefresh.first(where: { _ in true })
+      await liveSessionManager.refreshCurrentSessionIfExpired()
+    }
+    Dependencies[sut.clientID].sessionManager = delayedSessionManager
 
     let events = LockIsolated([(AuthChangeEvent, Session?)]())
     let registration = await sut.onAuthStateChange { event, session in
@@ -155,15 +154,20 @@ final class AuthClientTests: XCTestCase {
     }
     defer { registration.remove() }
 
-    _ = await refreshRequestStarted.first(where: { _ in true })
+    _ = await initialRefreshEntered.first(where: { _ in true })
     _ = try await sut.exchangeCodeForSession(authCode: "synthetic-recovery-code")
 
-    releaseRefreshResponseContinuation.yield(())
-    releaseRefreshResponseContinuation.finish()
+    releaseInitialRefreshContinuation.yield(())
+    releaseInitialRefreshContinuation.finish()
     await Task.megaYield()
 
-    XCTAssertEqual(refreshTokens.value, [refreshTokenA])
-    XCTAssertEqual(Dependencies[sut.clientID].sessionStorage.get()?.refreshToken, sessionB.refreshToken)
+    XCTAssertEqual(
+      refreshTokens.value,
+      [],
+      "Delayed initial refresh entry must select the current recovery session, not captured A."
+    )
+    XCTAssertEqual(
+      Dependencies[sut.clientID].sessionStorage.get()?.refreshToken, sessionB.refreshToken)
     XCTAssertFalse(
       events.value.contains { $0.0 == .tokenRefreshed && $0.1?.user.id == sessionA.user.id },
       "Delayed initial-session work must not publish an old session after code exchange installs B."
@@ -1356,6 +1360,282 @@ final class AuthClientTests: XCTestCase {
         data: ["custom_key": .string("custom_value")]
       )
     )
+  }
+
+  func testUpdateUserPreservesCredentialsRotatedWhileRequestIsInFlight() async throws {
+    var initialSession = Session.validSession
+    initialSession.accessToken = "initial-access"
+    initialSession.refreshToken = "initial-refresh"
+
+    var refreshedSession = initialSession
+    refreshedSession.accessToken = "refreshed-access"
+    refreshedSession.refreshToken = "refreshed-refresh"
+    let responseSession = refreshedSession
+
+    var updatedUser = initialSession.user
+    updatedUser.email = "updated@example.test"
+    let responseUser = updatedUser
+
+    let (updateRequestStarted, updateRequestStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseUpdateResponse, releaseUpdateResponseContinuation) = AsyncStream<Void>.makeStream()
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+
+      if url.path.hasSuffix("/user") {
+        updateRequestStartedContinuation.yield(())
+        _ = await releaseUpdateResponse.first(where: { _ in true })
+        return (try AuthClient.Configuration.jsonEncoder.encode(responseUser), response)
+      }
+
+      if url.path.hasSuffix("/token") {
+        return (try AuthClient.Configuration.jsonEncoder.encode(responseSession), response)
+      }
+
+      throw URLError(.badServerResponse)
+    }
+
+    let sut = makeSUT(fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(initialSession)
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    let update = Task {
+      try await sut.update(user: UserAttributes(password: "new-password"))
+    }
+    _ = await updateRequestStarted.first(where: { _ in true })
+    _ = try await sut.refreshSession(refreshToken: initialSession.refreshToken)
+
+    releaseUpdateResponseContinuation.yield(())
+    releaseUpdateResponseContinuation.finish()
+    _ = try await update.value
+
+    let storedSession = Dependencies[sut.clientID].sessionStorage.get()
+    XCTAssertEqual(storedSession?.accessToken, refreshedSession.accessToken)
+    XCTAssertEqual(storedSession?.refreshToken, refreshedSession.refreshToken)
+    XCTAssertEqual(storedSession?.user.email, updatedUser.email)
+    XCTAssertTrue(
+      events.value.contains {
+        $0.0 == .userUpdated
+          && $0.1?.accessToken == refreshedSession.accessToken
+          && $0.1?.user.email == updatedUser.email
+      }
+    )
+  }
+
+  func testUpdateUserCannotOverwriteAReplacementSession() async throws {
+    var initialSession = Session.validSession
+    initialSession.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+    var replacementSession = Session.validSession
+    replacementSession.accessToken = "replacement-access"
+    replacementSession.refreshToken = "replacement-refresh"
+    replacementSession.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
+    var updatedUser = initialSession.user
+    updatedUser.email = "updated@example.test"
+    let responseUser = updatedUser
+
+    let (updateRequestStarted, updateRequestStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseUpdateResponse, releaseUpdateResponseContinuation) = AsyncStream<Void>.makeStream()
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      updateRequestStartedContinuation.yield(())
+      _ = await releaseUpdateResponse.first(where: { _ in true })
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+      return (try AuthClient.Configuration.jsonEncoder.encode(responseUser), response)
+    }
+
+    let sut = makeSUT(fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(initialSession)
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    let update = Task {
+      try await sut.update(user: UserAttributes(password: "new-password"))
+    }
+    _ = await updateRequestStarted.first(where: { _ in true })
+    await Dependencies[sut.clientID].sessionManager.update(replacementSession)
+
+    releaseUpdateResponseContinuation.yield(())
+    releaseUpdateResponseContinuation.finish()
+    let updateResult = await update.result
+
+    if case .success = updateResult {
+      XCTFail("A user update captured for A must fail after B replaces it.")
+    }
+    XCTAssertEqual(Dependencies[sut.clientID].sessionStorage.get(), replacementSession)
+    XCTAssertFalse(events.value.contains { $0.0 == .userUpdated })
+  }
+
+  func testUpdateUserCannotRestoreARemovedSession() async throws {
+    let initialSession = Session.validSession
+    var updatedUser = initialSession.user
+    updatedUser.email = "updated@example.test"
+    let responseUser = updatedUser
+
+    let (updateRequestStarted, updateRequestStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseUpdateResponse, releaseUpdateResponseContinuation) = AsyncStream<Void>.makeStream()
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      updateRequestStartedContinuation.yield(())
+      _ = await releaseUpdateResponse.first(where: { _ in true })
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+      return (try AuthClient.Configuration.jsonEncoder.encode(responseUser), response)
+    }
+
+    let sut = makeSUT(fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(initialSession)
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    let update = Task {
+      try await sut.update(user: UserAttributes(password: "new-password"))
+    }
+    _ = await updateRequestStarted.first(where: { _ in true })
+    await Dependencies[sut.clientID].sessionManager.remove()
+
+    releaseUpdateResponseContinuation.yield(())
+    releaseUpdateResponseContinuation.finish()
+    let updateResult = await update.result
+
+    if case .success = updateResult {
+      XCTFail("A user update must not restore a session removed while it was in flight.")
+    }
+    XCTAssertNil(Dependencies[sut.clientID].sessionStorage.get())
+    XCTAssertFalse(events.value.contains { $0.0 == .userUpdated })
+  }
+
+  func testUpdateUserSessionErrorCannotRemoveAReplacementSession() async throws {
+    var initialSession = Session.validSession
+    initialSession.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000A1")!
+    var replacementSession = Session.validSession
+    replacementSession.accessToken = "replacement-access"
+    replacementSession.refreshToken = "replacement-refresh"
+    replacementSession.user.id = UUID(uuidString: "00000000-0000-0000-0000-0000000000B1")!
+    let errorData = Data(
+      """
+      {
+        "error_code": "session_not_found",
+        "message": "Synthetic stale user-update response"
+      }
+      """.utf8
+    )
+
+    let (updateRequestStarted, updateRequestStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseUpdateResponse, releaseUpdateResponseContinuation) = AsyncStream<Void>.makeStream()
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      updateRequestStartedContinuation.yield(())
+      _ = await releaseUpdateResponse.first(where: { _ in true })
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 403,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+      return (errorData, response)
+    }
+
+    let sut = makeSUT(fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(initialSession)
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    let update = Task {
+      try await sut.update(user: UserAttributes(password: "new-password"))
+    }
+    _ = await updateRequestStarted.first(where: { _ in true })
+    await Dependencies[sut.clientID].sessionManager.update(replacementSession)
+
+    releaseUpdateResponseContinuation.yield(())
+    releaseUpdateResponseContinuation.finish()
+    let updateResult = await update.result
+
+    if case .success = updateResult {
+      XCTFail("The stale invalid-session response must still fail the update.")
+    }
+    XCTAssertEqual(Dependencies[sut.clientID].sessionStorage.get(), replacementSession)
+    XCTAssertFalse(events.value.contains { $0.0 == .signedOut })
+  }
+
+  func testUpdateUserSessionErrorStillRemovesItsOwnedSession() async throws {
+    let errorData = Data(
+      """
+      {
+        "error_code": "session_not_found",
+        "message": "Synthetic current user-update response"
+      }
+      """.utf8
+    )
+    let fetch: AuthClient.FetchHandler = { request in
+      guard let url = request.url else {
+        throw URLError(.badURL)
+      }
+
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 403,
+        httpVersion: nil,
+        headerFields: nil
+      )!
+      return (errorData, response)
+    }
+
+    let sut = makeSUT(fetch: fetch)
+    Dependencies[sut.clientID].sessionStorage.store(.validSession)
+    let events = LockIsolated([(AuthChangeEvent, Session?)]())
+    let registration = await sut.onAuthStateChange { event, session in
+      events.withValue { $0.append((event, session)) }
+    }
+    defer { registration.remove() }
+
+    let updateResult = await Task {
+      try await sut.update(user: UserAttributes(password: "new-password"))
+    }.result
+
+    if case .success = updateResult {
+      XCTFail("An invalid response for the current session must fail the update.")
+    }
+    XCTAssertNil(Dependencies[sut.clientID].sessionStorage.get())
+    XCTAssertTrue(events.value.contains { $0.0 == .signedOut })
   }
 
   func testResetPasswordForEmail() async throws {

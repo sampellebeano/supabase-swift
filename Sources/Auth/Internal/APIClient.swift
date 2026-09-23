@@ -23,7 +23,7 @@ extension HTTPClient {
 struct APIClient: Sendable {
   enum SessionCleanupPolicy: Sendable {
     case immediate
-    case refreshOwner
+    case deferredToSessionOwner
   }
 
   let clientID: AuthClientID

@@ -146,7 +146,8 @@ final class SessionManagerTests: XCTestCase {
     Dependencies[clientID].sessionStorage.store(sessionA)
 
     let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
-    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>
+      .makeStream()
 
     await http.when(
       { $0.url.path.contains("/token") },
@@ -186,7 +187,8 @@ final class SessionManagerTests: XCTestCase {
       "A completed refresh must not emit a stale token-refreshed event."
     )
     if case .success = refreshResult {
-      XCTFail("A refresh superseded by a recovery session must not return a successful stale session.")
+      XCTFail(
+        "A refresh superseded by a recovery session must not return a successful stale session.")
     }
   }
 
@@ -217,8 +219,10 @@ final class SessionManagerTests: XCTestCase {
 
       Dependencies[isolatedClientID].sessionStorage.store(sessionA)
 
-      let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
-      let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+      let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>
+        .makeStream()
+      let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>
+        .makeStream()
       let errorResponse = HTTPResponse.stub(
         """
         {
@@ -336,6 +340,7 @@ final class SessionManagerTests: XCTestCase {
 
     let requestedTokens = LockIsolated([String]())
     let (refreshAStarted, refreshAStartedContinuation) = AsyncStream<Void>.makeStream()
+    let (refreshBStarted, refreshBStartedContinuation) = AsyncStream<Void>.makeStream()
     let (releaseRefreshA, releaseRefreshAContinuation) = AsyncStream<Void>.makeStream()
     let (releaseRefreshB, releaseRefreshBContinuation) = AsyncStream<Void>.makeStream()
 
@@ -358,6 +363,7 @@ final class SessionManagerTests: XCTestCase {
           _ = await releaseRefreshA.first(where: { _ in true })
           return .stub(responseSessionA)
         case sessionBRefreshToken:
+          refreshBStartedContinuation.yield(())
           _ = await releaseRefreshB.first(where: { _ in true })
           return .stub(responseSessionB)
         default:
@@ -376,16 +382,26 @@ final class SessionManagerTests: XCTestCase {
     let refreshB = Task {
       try await sut.refreshSession(sessionBRefreshToken)
     }
+    _ = await refreshBStarted.first(where: { _ in true })
+
+    releaseRefreshAContinuation.yield(())
+    releaseRefreshAContinuation.finish()
+    let refreshAResult = await refreshA.result
+
     let secondRefreshB = Task {
       try await sut.refreshSession(sessionBRefreshToken)
     }
+    await Task.megaYield()
+
+    XCTAssertEqual(
+      requestedTokens.value,
+      [sessionARefreshToken, sessionBRefreshToken],
+      "A's deferred cleanup must not clear B's still-pending refresh operation."
+    )
 
     releaseRefreshBContinuation.yield(())
     releaseRefreshBContinuation.finish()
-    releaseRefreshAContinuation.yield(())
-    releaseRefreshAContinuation.finish()
 
-    let refreshAResult = await refreshA.result
     let refreshBResult = await refreshB.result
     let secondRefreshBResult = await secondRefreshB.result
 
@@ -410,7 +426,8 @@ final class SessionManagerTests: XCTestCase {
     Dependencies[clientID].sessionStorage.store(sessionA)
 
     let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
-    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>
+      .makeStream()
 
     await http.when(
       { $0.url.path.contains("/token") },
@@ -453,7 +470,8 @@ final class SessionManagerTests: XCTestCase {
 
     let requestCount = LockIsolated(0)
     let (refreshRequestStarted, refreshRequestStartedContinuation) = AsyncStream<Void>.makeStream()
-    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>.makeStream()
+    let (releaseRefreshResponse, releaseRefreshResponseContinuation) = AsyncStream<Void>
+      .makeStream()
 
     await http.when(
       { $0.url.path.contains("/token") },

@@ -1,12 +1,23 @@
 import Foundation
 
+struct UserUpdateContext: Sendable {
+  // User-update HTTP work may overlap token rotation or authoritative replacement.
+  // The captured epoch identifies its session owner; the session supplies the
+  // request credential and identity that may safely receive the response.
+  let session: Session
+  let epoch: UInt64
+}
+
 struct SessionManager: Sendable {
   var session: @Sendable () async throws -> Session
   var refreshSession: @Sendable (_ refreshToken: String) async throws -> Session
   var refreshCurrentSession: @Sendable () async throws -> Session
   var refreshCurrentSessionIfExpired: @Sendable () async -> Void
   var update: @Sendable (_ session: Session) async -> Void
-  var updateUser: @Sendable (_ session: Session) async -> Void
+  var userUpdateContext: @Sendable () async throws -> UserUpdateContext
+  var commitUserUpdate:
+    @Sendable (_ user: User, _ context: UserUpdateContext) async throws -> Session
+  var removeIfUserUpdateOwned: @Sendable (_ context: UserUpdateContext) async -> Bool
   var remove: @Sendable () async -> Void
 
   var startAutoRefresh: @Sendable () async -> Void
@@ -22,7 +33,9 @@ extension SessionManager {
       refreshCurrentSession: { try await instance.refreshCurrentSession() },
       refreshCurrentSessionIfExpired: { await instance.refreshCurrentSessionIfExpired() },
       update: { await instance.update($0) },
-      updateUser: { await instance.updateUser($0) },
+      userUpdateContext: { try await instance.userUpdateContext() },
+      commitUserUpdate: { try await instance.commitUserUpdate($0, context: $1) },
+      removeIfUserUpdateOwned: { await instance.removeIfUserUpdateOwned($0) },
       remove: { await instance.remove() },
       startAutoRefresh: { await instance.startAutoRefreshToken() },
       stopAutoRefresh: { await instance.stopAutoRefreshToken() }
@@ -111,7 +124,7 @@ private actor LiveSessionManager {
                   UserCredentials(refreshToken: refreshToken)
                 )
               ),
-              sessionCleanupPolicy: .refreshOwner
+              sessionCleanupPolicy: .deferredToSessionOwner
             )
             .decoded(as: Session.self, decoder: configuration.decoder)
 
@@ -162,8 +175,45 @@ private actor LiveSessionManager {
     sessionStorage.store(session)
   }
 
-  func updateUser(_ session: Session) {
-    sessionStorage.store(session)
+  func userUpdateContext() async throws -> UserUpdateContext {
+    _ = try await session()
+    guard let currentSession = sessionStorage.get() else {
+      throw AuthError.sessionMissing
+    }
+    return UserUpdateContext(session: currentSession, epoch: sessionEpoch)
+  }
+
+  func commitUserUpdate(_ user: User, context: UserUpdateContext) throws -> Session {
+    guard sessionEpoch == context.epoch,
+      var currentSession = sessionStorage.get(),
+      currentSession.user.id == context.session.user.id,
+      user.id == context.session.user.id
+    else {
+      throw CancellationError()
+    }
+
+    currentSession.user = user
+    sessionStorage.store(currentSession)
+    eventEmitter.emit(.userUpdated, session: currentSession)
+    return currentSession
+  }
+
+  func removeIfUserUpdateOwned(_ context: UserUpdateContext) -> Bool {
+    // A cleanup response for an older access token must not remove credentials
+    // installed by a refresh or authoritative replacement while it was in flight.
+    guard sessionEpoch == context.epoch,
+      let currentSession = sessionStorage.get(),
+      currentSession.user.id == context.session.user.id,
+      currentSession.accessToken == context.session.accessToken,
+      currentSession.refreshToken == context.session.refreshToken
+    else {
+      return false
+    }
+
+    invalidateRefreshOperations()
+    sessionStorage.delete()
+    eventEmitter.emit(.signedOut, session: nil)
+    return true
   }
 
   func remove() {
