@@ -9,7 +9,6 @@ public struct AuthMFA: Sendable {
   var encoder: JSONEncoder { Dependencies[clientID].encoder }
   var decoder: JSONDecoder { Dependencies[clientID].decoder }
   var sessionManager: SessionManager { Dependencies[clientID].sessionManager }
-  var eventEmitter: AuthStateChangeEventEmitter { Dependencies[clientID].eventEmitter }
 
   /// Starts the enrollment process for a new Multi-Factor Authentication (MFA) factor. This method
   /// creates a new `unverified` factor.
@@ -38,12 +37,21 @@ public struct AuthMFA: Sendable {
   /// - Parameter params: The parameters for creating a challenge.
   /// - Returns: An authentication response with the challenge information.
   public func challenge(params: MFAChallengeParams) async throws -> AuthMFAChallengeResponse {
-    try await api.authorizedExecute(
+    let context = try await sessionManager.mfaContext()
+    return try await challenge(params: params, context: context)
+  }
+
+  private func challenge(
+    params: MFAChallengeParams,
+    context: SessionMutationContext
+  ) async throws -> AuthMFAChallengeResponse {
+    try await execute(
       HTTPRequest(
         url: configuration.url.appendingPathComponent("factors/\(params.factorId)/challenge"),
         method: .post,
         body: params.channel == nil ? nil : encoder.encode(["channel": params.channel])
-      )
+      ),
+      context: context
     )
     .decoded(decoder: decoder)
   }
@@ -55,18 +63,44 @@ public struct AuthMFA: Sendable {
   /// - Returns: An authentication response after verifying the factor.
   @discardableResult
   public func verify(params: MFAVerifyParams) async throws -> AuthMFAVerifyResponse {
-    let response: AuthMFAVerifyResponse = try await api.authorizedExecute(
+    let context = try await sessionManager.mfaContext()
+    return try await verify(params: params, context: context)
+  }
+
+  private func verify(
+    params: MFAVerifyParams,
+    context: SessionMutationContext
+  ) async throws -> AuthMFAVerifyResponse {
+    let response: AuthMFAVerifyResponse = try await execute(
       HTTPRequest(
         url: configuration.url.appendingPathComponent("factors/\(params.factorId)/verify"),
         method: .post,
         body: encoder.encode(params)
-      )
+      ),
+      context: context
     ).decoded(decoder: decoder)
 
-    await sessionManager.update(response)
+    try await sessionManager.commitMFAVerification(response, context)
+    return response
+  }
 
-    eventEmitter.emit(.mfaChallengeVerified, session: response, token: nil)
-
+  private func execute(_ request: HTTPRequest, context: SessionMutationContext) async throws
+    -> HTTPResponse
+  {
+    let requestContext = try await sessionManager.mfaRequestContext(context)
+    var request = request
+    request.headers[.authorization] = "Bearer \(requestContext.session.accessToken)"
+    let response: HTTPResponse
+    do {
+      response = try await api.execute(request, sessionCleanupPolicy: .deferredToSessionOwner)
+    } catch {
+      try await sessionManager.requireMFAContext(context)
+      if error as? AuthError == .sessionMissing {
+        _ = await sessionManager.removeIfMutationOwned(requestContext)
+      }
+      throw error
+    }
+    try await sessionManager.requireMFAContext(context)
     return response
   }
 
@@ -96,11 +130,16 @@ public struct AuthMFA: Sendable {
   public func challengeAndVerify(
     params: MFAChallengeAndVerifyParams
   ) async throws -> AuthMFAVerifyResponse {
-    let response = try await challenge(params: MFAChallengeParams(factorId: params.factorId))
+    let context = try await sessionManager.mfaContext()
+    let response = try await challenge(
+      params: MFAChallengeParams(factorId: params.factorId),
+      context: context
+    )
     return try await verify(
       params: MFAVerifyParams(
         factorId: params.factorId, challengeId: response.id, code: params.code
-      )
+      ),
+      context: context
     )
   }
 
@@ -122,7 +161,9 @@ public struct AuthMFA: Sendable {
   /// Returns the Authenticator Assurance Level (AAL) for the active session.
   ///
   /// - Returns: An authentication response with the Authenticator Assurance Level.
-  public func getAuthenticatorAssuranceLevel() async throws -> AuthMFAGetAuthenticatorAssuranceLevelResponse {
+  public func getAuthenticatorAssuranceLevel() async throws
+    -> AuthMFAGetAuthenticatorAssuranceLevelResponse
+  {
     do {
       let session = try await sessionManager.session()
       let payload = JWT.decodePayload(session.accessToken)

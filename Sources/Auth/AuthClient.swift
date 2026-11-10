@@ -1214,7 +1214,7 @@ public actor AuthClient {
       return updatedUser
     } catch {
       if error as? AuthError == .sessionMissing {
-        _ = await sessionManager.removeIfUserUpdateOwned(userUpdateContext)
+        _ = await sessionManager.removeIfMutationOwned(userUpdateContext)
       }
       throw error
     }

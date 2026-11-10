@@ -1,9 +1,8 @@
 import Foundation
 
-struct UserUpdateContext: Sendable {
-  // User-update HTTP work may overlap token rotation or authoritative replacement.
-  // The captured epoch identifies its session owner; the session supplies the
-  // request credential and identity that may safely receive the response.
+struct SessionMutationContext: Sendable {
+  // An authoritative session replacement retires in-flight mutations captured
+  // under an earlier epoch, even when the replacement has the same user ID.
   let session: Session
   let epoch: UInt64
 }
@@ -14,10 +13,16 @@ struct SessionManager: Sendable {
   var refreshCurrentSession: @Sendable () async throws -> Session
   var refreshCurrentSessionIfExpired: @Sendable () async -> Void
   var update: @Sendable (_ session: Session) async -> Void
-  var userUpdateContext: @Sendable () async throws -> UserUpdateContext
+  var userUpdateContext: @Sendable () async throws -> SessionMutationContext
   var commitUserUpdate:
-    @Sendable (_ user: User, _ context: UserUpdateContext) async throws -> Session
-  var removeIfUserUpdateOwned: @Sendable (_ context: UserUpdateContext) async -> Bool
+    @Sendable (_ user: User, _ context: SessionMutationContext) async throws -> Session
+  var mfaContext: @Sendable () async throws -> SessionMutationContext
+  var mfaRequestContext:
+    @Sendable (_ context: SessionMutationContext) async throws -> SessionMutationContext
+  var requireMFAContext: @Sendable (_ context: SessionMutationContext) async throws -> Void
+  var commitMFAVerification:
+    @Sendable (_ session: Session, _ context: SessionMutationContext) async throws -> Void
+  var removeIfMutationOwned: @Sendable (_ context: SessionMutationContext) async -> Bool
   var remove: @Sendable () async -> Void
 
   var startAutoRefresh: @Sendable () async -> Void
@@ -35,7 +40,11 @@ extension SessionManager {
       update: { await instance.update($0) },
       userUpdateContext: { try await instance.userUpdateContext() },
       commitUserUpdate: { try await instance.commitUserUpdate($0, context: $1) },
-      removeIfUserUpdateOwned: { await instance.removeIfUserUpdateOwned($0) },
+      mfaContext: { try await instance.mfaContext() },
+      mfaRequestContext: { try await instance.mfaRequestContext($0) },
+      requireMFAContext: { _ = try await instance.requireMFAContext($0) },
+      commitMFAVerification: { try await instance.commitMFAVerification($0, context: $1) },
+      removeIfMutationOwned: { await instance.removeIfMutationOwned($0) },
       remove: { await instance.remove() },
       startAutoRefresh: { await instance.startAutoRefreshToken() },
       stopAutoRefresh: { await instance.stopAutoRefreshToken() }
@@ -175,15 +184,15 @@ private actor LiveSessionManager {
     sessionStorage.store(session)
   }
 
-  func userUpdateContext() async throws -> UserUpdateContext {
+  func userUpdateContext() async throws -> SessionMutationContext {
     _ = try await session()
     guard let currentSession = sessionStorage.get() else {
       throw AuthError.sessionMissing
     }
-    return UserUpdateContext(session: currentSession, epoch: sessionEpoch)
+    return SessionMutationContext(session: currentSession, epoch: sessionEpoch)
   }
 
-  func commitUserUpdate(_ user: User, context: UserUpdateContext) throws -> Session {
+  func commitUserUpdate(_ user: User, context: SessionMutationContext) throws -> Session {
     guard sessionEpoch == context.epoch,
       var currentSession = sessionStorage.get(),
       currentSession.user.id == context.session.user.id,
@@ -198,7 +207,42 @@ private actor LiveSessionManager {
     return currentSession
   }
 
-  func removeIfUserUpdateOwned(_ context: UserUpdateContext) -> Bool {
+  func mfaContext() throws -> SessionMutationContext {
+    try Task.checkCancellation()
+    guard let initial = sessionStorage.get() else {
+      throw AuthError.sessionMissing
+    }
+    return SessionMutationContext(session: initial, epoch: sessionEpoch)
+  }
+
+  func mfaRequestContext(_ context: SessionMutationContext) async throws -> SessionMutationContext {
+    _ = try requireMFAContext(context)
+    _ = try await session()
+    let current = try requireMFAContext(context)
+    return SessionMutationContext(session: current, epoch: context.epoch)
+  }
+
+  func requireMFAContext(_ context: SessionMutationContext) throws -> Session {
+    try Task.checkCancellation()
+    guard sessionEpoch == context.epoch,
+      let current = sessionStorage.get(),
+      current.user.id == context.session.user.id
+    else {
+      throw CancellationError()
+    }
+    return current
+  }
+
+  func commitMFAVerification(_ response: Session, context: SessionMutationContext) throws {
+    _ = try requireMFAContext(context)
+    guard response.user.id == context.session.user.id else {
+      throw CancellationError()
+    }
+    update(response)
+    eventEmitter.emit(.mfaChallengeVerified, session: response)
+  }
+
+  func removeIfMutationOwned(_ context: SessionMutationContext) -> Bool {
     // A cleanup response for an older access token must not remove credentials
     // installed by a refresh or authoritative replacement while it was in flight.
     guard sessionEpoch == context.epoch,

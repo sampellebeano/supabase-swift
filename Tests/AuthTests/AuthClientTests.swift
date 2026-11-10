@@ -2139,7 +2139,7 @@ final class AuthClientTests: XCTestCase {
     Mock(
       url: clientURL.appendingPathComponent("factors/\(factorId)/verify"),
       statusCode: 200,
-      data: [.post: MockData.session]
+      data: [.post: MockData.mfaVerifiedSession]
     )
     .snapshotRequest {
       #"""
@@ -2234,7 +2234,7 @@ final class AuthClientTests: XCTestCase {
       url: clientURL.appendingPathComponent("factors/\(factorId)/verify"),
       statusCode: 200,
       data: [
-        .post: MockData.session
+        .post: MockData.mfaVerifiedSession
       ]
     )
     .snapshotRequest {
@@ -3211,6 +3211,12 @@ enum MockData {
   static let session = try! Data(
     contentsOf: Bundle.module.url(forResource: "session", withExtension: "json")!
   )
+
+  static let mfaVerifiedSession: Data = {
+    var verified = try! AuthClient.Configuration.jsonDecoder.decode(Session.self, from: session)
+    verified.user = Session.validSession.user
+    return try! AuthClient.Configuration.jsonEncoder.encode(verified)
+  }()
 
   static let user = try! Data(
     contentsOf: Bundle.module.url(forResource: "user", withExtension: "json")!
