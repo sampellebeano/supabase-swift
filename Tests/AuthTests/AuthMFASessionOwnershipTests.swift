@@ -1,5 +1,6 @@
 import Auth
 import Foundation
+import Helpers
 import XCTest
 
 @MainActor
@@ -237,6 +238,139 @@ final class AuthMFASessionOwnershipTests: XCTestCase {
     XCTAssertEqual(fixture.storage.writes.count, 1)
   }
 
+  func testVerifiedRefreshCannotBorrowAnotherAccountsToken() async throws {
+    try await assertVerifiedRefreshRejectsReplacement(signBackIntoA: false)
+  }
+
+  func testVerifiedRefreshCannotBorrowNewSessionForSameAccount() async throws {
+    try await assertVerifiedRefreshRejectsReplacement(signBackIntoA: true)
+  }
+
+  private func assertVerifiedRefreshRejectsReplacement(signBackIntoA: Bool) async throws {
+    let fixture = try MFAVerificationFixture()
+    let verification = try await fixture.verifyForRefresh()
+    let replacement = try await fixture.auth.signIn(
+      email: "b@fixture.invalid", password: "fixture-only")
+    let current: Session
+    if signBackIntoA {
+      current = try await fixture.auth.signIn(email: "a@fixture.invalid", password: "fixture-only")
+      XCTAssertEqual(current.user.id, fixture.initial.user.id)
+    } else {
+      current = replacement
+    }
+    let requestCount = await fixture.transport.requests.count
+    let writes = fixture.storage.writes
+
+    do {
+      _ = try await fixture.auth.mfa.refreshVerifiedSession(verification)
+      XCTFail("The superseded verification must be rejected")
+    } catch is CancellationError {}
+
+    let laterRequestCount = await fixture.transport.requests.count
+    XCTAssertEqual(laterRequestCount, requestCount)
+    XCTAssertTrue(fixture.auth.currentSession == current)
+    XCTAssertTrue(fixture.storage.writes == writes)
+  }
+
+  func testVerifiedRefreshUsesLatestSameEpochTokenAndReturnsItsAssurance() async throws {
+    let fixture = try MFAVerificationFixture()
+    let verification = try await fixture.verifyForRefresh()
+    _ = try await fixture.auth.refreshSession()
+
+    let assurance = try await fixture.auth.mfa.refreshVerifiedSession(verification)
+
+    XCTAssertEqual(assurance.currentLevel, "aal2")
+    XCTAssertTrue(assurance.currentAuthenticationMethods.contains { $0.method == "totp" })
+    let requestedTokens = await fixture.transport.refreshTokens
+    XCTAssertTrue(requestedTokens == [fixture.elevated.refreshToken, fixture.refreshed.refreshToken])
+  }
+
+  func testVerifiedRefreshReturnsAssuranceFromRefreshRatherThanVerifyResponse() async throws {
+    let fixture = try MFAVerificationFixture()
+    let verification = try await fixture.verifyForRefresh()
+    let assurance = try await fixture.auth.mfa.refreshVerifiedSession(verification)
+
+    XCTAssertEqual(assurance.currentLevel, "aal1")
+    XCTAssertFalse(assurance.currentAuthenticationMethods.contains { $0.method == "totp" })
+    XCTAssertTrue(fixture.auth.currentSession == fixture.refreshed)
+  }
+
+  func testHeldVerifiedRefreshSessionMissingCannotClearReplacement() async throws {
+    let started = expectation(description: "Verified refresh used the original token")
+    let fixture = try MFAVerificationFixture(refreshStarted: started, refreshSessionMissing: true)
+    let verification = try await fixture.verifyForRefresh()
+    let pending = Task { try await fixture.auth.mfa.refreshVerifiedSession(verification) }
+    await fulfillment(of: [started], timeout: 3)
+    let replacement: Session
+    do {
+      replacement = try await fixture.auth.signIn(
+        email: "b@fixture.invalid", password: "fixture-only")
+    } catch {
+      await fixture.transport.releaseVerification()
+      _ = await pending.result
+      throw error
+    }
+    let writes = fixture.storage.writes
+    await fixture.transport.releaseVerification()
+
+    do {
+      _ = try await pending.value
+      XCTFail("The superseded refresh must be cancelled")
+    } catch is CancellationError {}
+
+    XCTAssertTrue(fixture.auth.currentSession == replacement)
+    XCTAssertTrue(fixture.storage.writes == writes)
+  }
+
+  func testVerifiedRefreshRejectsExplicitDifferentTokenExchangeForSameActor() async throws {
+    let fixture = try MFAVerificationFixture()
+    let verification = try await fixture.verifyForRefresh()
+    let replacement = try await fixture.auth.refreshSession(
+      refreshToken: MFAVerificationFixture.noncurrentToken)
+    XCTAssertEqual(replacement.user.id, fixture.initial.user.id)
+    XCTAssertTrue(fixture.auth.currentSession == replacement)
+    let writes = fixture.storage.writes
+
+    do {
+      _ = try await fixture.auth.mfa.refreshVerifiedSession(verification)
+      XCTFail("An explicit token exchange replaces the previously verified session")
+    } catch is CancellationError {}
+
+    let requestedTokens = await fixture.transport.refreshTokens
+    XCTAssertEqual(requestedTokens.count, 1)
+    XCTAssertTrue(fixture.auth.currentSession == replacement)
+    XCTAssertTrue(fixture.storage.writes == writes)
+  }
+
+  func testOrdinaryRefreshJoinedByVerifiedRefreshRejectsWrongActorResponse() async throws {
+    let started = expectation(description: "Ordinary refresh started")
+    let joined = expectation(description: "Verified refresh joined the ordinary request")
+    let fixture = try MFAVerificationFixture(
+      refreshStarted: started, refreshReturnsReplacement: true,
+      logger: RefreshJoinLogger(joined: joined))
+    let verification = try await fixture.verifyForRefresh()
+    let writes = fixture.storage.writes
+    let ordinary = Task { try await fixture.auth.refreshSession() }
+    await fulfillment(of: [started], timeout: 3)
+    let verified = Task { try await fixture.auth.mfa.refreshVerifiedSession(verification) }
+    await fulfillment(of: [joined], timeout: 3)
+    await fixture.transport.releaseVerification()
+
+    do {
+      _ = try await ordinary.value
+      XCTFail("A shared refresh must reject the wrong actor before storage")
+    } catch is CancellationError {}
+    do {
+      _ = try await verified.value
+      XCTFail("The verified refresh must reject the wrong actor")
+    } catch is CancellationError {}
+
+    let requestedTokens = await fixture.transport.refreshTokens
+    XCTAssertEqual(requestedTokens.count, 1)
+    XCTAssertTrue(fixture.auth.currentSession == fixture.elevated)
+    XCTAssertTrue(fixture.storage.writes == writes)
+  }
+
   private func refreshAndRelease(_ fixture: MFAVerificationFixture, pending: Task<Void, any Error>)
     async throws
   {
@@ -288,6 +422,8 @@ final class AuthMFASessionOwnershipTests: XCTestCase {
 
 @MainActor
 private struct MFAVerificationFixture {
+  static let noncurrentToken = "fixture-only-noncurrent-refresh-token"
+
   let auth: AuthClient
   let initial: Session
   let elevated: Session
@@ -298,7 +434,9 @@ private struct MFAVerificationFixture {
 
   init(
     verifyStarted: XCTestExpectation? = nil, challengeStarted: XCTestExpectation? = nil,
-    replaceWithSameOwner: Bool = false, outcome: VerificationOutcome = .success
+    replaceWithSameOwner: Bool = false, outcome: VerificationOutcome = .success,
+    refreshStarted: XCTestExpectation? = nil, refreshSessionMissing: Bool = false,
+    refreshReturnsReplacement: Bool = false, logger: (any SupabaseLogger)? = nil
   ) throws {
     let owner = UUID()
     let expiration = Date().timeIntervalSince1970.rounded(.down) + 3_600
@@ -313,13 +451,32 @@ private struct MFAVerificationFixture {
     let refreshed = Self.session(
       userID: owner, expiration: expiration, level: "aal1", method: "password",
       tokenLabel: "a-refreshed")
+    let signedBackIn = Self.session(
+      userID: owner, expiration: expiration, level: "aal1", method: "password",
+      tokenLabel: "a-new-signin")
+    let exchangedSameActor = Self.session(
+      userID: owner, expiration: expiration, level: "aal1", method: "password",
+      tokenLabel: "a-exchanged")
+    let refreshedAfterRotation = Self.session(
+      userID: owner, expiration: expiration, level: "aal2", method: "totp",
+      tokenLabel: "a-refreshed-twice")
     let storage = try MFAVerificationStorage(initial: initial)
     let transport = MFAVerificationTransport(
       verifyBody: try AuthClient.Configuration.jsonEncoder.encode(elevated),
-      replacementBody: try AuthClient.Configuration.jsonEncoder.encode(replacement),
-      refreshBody: try AuthClient.Configuration.jsonEncoder.encode(refreshed),
+      passwordBodies: [
+        "b@fixture.invalid": try AuthClient.Configuration.jsonEncoder.encode(replacement),
+        "a@fixture.invalid": try AuthClient.Configuration.jsonEncoder.encode(signedBackIn),
+      ],
+      refreshBody: try AuthClient.Configuration.jsonEncoder.encode(
+        refreshReturnsReplacement ? replacement : refreshed),
+      refreshBodies: [
+        refreshed.refreshToken: try AuthClient.Configuration.jsonEncoder.encode(refreshedAfterRotation),
+        Self.noncurrentToken: try AuthClient.Configuration.jsonEncoder.encode(exchangedSameActor),
+      ],
       verifyStarted: verifyStarted,
       challengeStarted: challengeStarted,
+      refreshStarted: refreshStarted,
+      refreshSessionMissing: refreshSessionMissing,
       outcome: outcome
     )
     let auth = AuthClient(
@@ -327,6 +484,7 @@ private struct MFAVerificationFixture {
         url: URL(string: "https://kapture-mfa-fixture.invalid/auth/v1")!,
         storageKey: MFAVerificationStorage.key,
         localStorage: storage,
+        logger: logger,
         fetch: { try await transport.fetch($0) },
         autoRefreshToken: false,
         emitLocalSessionAsInitialSession: true
@@ -353,6 +511,11 @@ private struct MFAVerificationFixture {
       params: MFAChallengeAndVerifyParams(factorId: "fixture-factor", code: "123456"))
   }
 
+  func verifyForRefresh() async throws -> AuthMFA.VerifiedSession {
+    try await auth.mfa.challengeAndVerifyForRefresh(
+      params: MFAChallengeAndVerifyParams(factorId: "fixture-factor", code: "123456"))
+  }
+
   private static func session(
     userID: UUID, expiration: TimeInterval, level: String, method: String, tokenLabel: String
   ) -> Session {
@@ -373,6 +536,16 @@ private struct MFAVerificationFixture {
         id: userID, appMetadata: [:], userMetadata: [:], aud: "authenticated",
         createdAt: fixedDate, updatedAt: fixedDate)
     )
+  }
+}
+
+private struct RefreshJoinLogger: SupabaseLogger {
+  let joined: XCTestExpectation
+
+  func log(message: SupabaseLogMessage) {
+    if message.message == "Refresh already in flight" {
+      joined.fulfill()
+    }
   }
 }
 
@@ -423,24 +596,32 @@ private enum VerificationOutcome: Sendable {
 
 private actor MFAVerificationTransport {
   private let verifyBody: Data
-  private let replacementBody: Data
+  private let passwordBodies: [String: Data]
   private let refreshBody: Data
+  private let refreshBodies: [String: Data]
   private let verifyStarted: XCTestExpectation?
   private let challengeStarted: XCTestExpectation?
+  private let refreshStarted: XCTestExpectation?
+  private let refreshSessionMissing: Bool
   private let outcome: VerificationOutcome
   private var released = false
   private var verification: CheckedContinuation<Void, Never>?
   private(set) var requests: [URLRequest] = []
+  private(set) var refreshTokens: [String] = []
 
   init(
-    verifyBody: Data, replacementBody: Data, refreshBody: Data, verifyStarted: XCTestExpectation?,
-    challengeStarted: XCTestExpectation?, outcome: VerificationOutcome
+    verifyBody: Data, passwordBodies: [String: Data], refreshBody: Data,
+    refreshBodies: [String: Data], verifyStarted: XCTestExpectation?, challengeStarted: XCTestExpectation?,
+    refreshStarted: XCTestExpectation?, refreshSessionMissing: Bool, outcome: VerificationOutcome
   ) {
     self.verifyBody = verifyBody
-    self.replacementBody = replacementBody
+    self.passwordBodies = passwordBodies
     self.refreshBody = refreshBody
+    self.refreshBodies = refreshBodies
     self.verifyStarted = verifyStarted
     self.challengeStarted = challengeStarted
+    self.refreshStarted = refreshStarted
+    self.refreshSessionMissing = refreshSessionMissing
     self.outcome = outcome
   }
 
@@ -474,11 +655,24 @@ private actor MFAVerificationTransport {
         throw URLError(.notConnectedToInternet)
       }
     case "/auth/v1/token" where url.query == "grant_type=password":
-      data = replacementBody
+      guard let email = try credential("email", in: request), let body = passwordBodies[email] else {
+        throw URLError(.unsupportedURL)
+      }
+      data = body
       status = 200
     case "/auth/v1/token" where url.query == "grant_type=refresh_token":
-      data = refreshBody
-      status = 200
+      guard let token = try credential("refresh_token", in: request) else {
+        throw URLError(.unsupportedURL)
+      }
+      refreshTokens.append(token)
+      await hold(refreshStarted)
+      if refreshSessionMissing {
+        data = Data(#"{"code":"session_not_found","msg":"Fixture session missing"}"#.utf8)
+        status = 401
+      } else {
+        data = refreshBodies[token] ?? refreshBody
+        status = 200
+      }
     case "/auth/v1/logout":
       data = Data()
       status = 204
@@ -496,6 +690,11 @@ private actor MFAVerificationTransport {
       throw URLError(.badServerResponse)
     }
     return (data, response)
+  }
+
+  private func credential(_ key: String, in request: URLRequest) throws -> String? {
+    guard let data = request.httpBody else { return nil }
+    return (try JSONSerialization.jsonObject(with: data) as? [String: Any])?[key] as? String
   }
 
   private func hold(_ expectation: XCTestExpectation?) async {

@@ -21,7 +21,8 @@ struct SessionManager: Sendable {
     @Sendable (_ context: SessionMutationContext) async throws -> SessionMutationContext
   var requireMFAContext: @Sendable (_ context: SessionMutationContext) async throws -> Void
   var commitMFAVerification:
-    @Sendable (_ session: Session, _ context: SessionMutationContext) async throws -> Void
+    @Sendable (_ session: Session, _ context: SessionMutationContext) async throws -> SessionMutationContext
+  var refreshVerifiedMFASession: @Sendable (_ context: SessionMutationContext) async throws -> Session
   var removeIfMutationOwned: @Sendable (_ context: SessionMutationContext) async -> Bool
   var remove: @Sendable () async -> Void
 
@@ -44,6 +45,7 @@ extension SessionManager {
       mfaRequestContext: { try await instance.mfaRequestContext($0) },
       requireMFAContext: { _ = try await instance.requireMFAContext($0) },
       commitMFAVerification: { try await instance.commitMFAVerification($0, context: $1) },
+      refreshVerifiedMFASession: { try await instance.refreshVerifiedMFASession($0) },
       removeIfMutationOwned: { await instance.removeIfMutationOwned($0) },
       remove: { await instance.remove() },
       startAutoRefresh: { await instance.startAutoRefreshToken() },
@@ -76,6 +78,8 @@ private actor LiveSessionManager {
     let operationID: UUID
     let epoch: UInt64
     let refreshToken: String
+    let replacesCurrentSession: Bool
+    var expectedUserID: UUID?
     let task: Task<Session, any Error>
   }
 
@@ -96,17 +100,37 @@ private actor LiveSessionManager {
   }
 
   func refreshSession(_ refreshToken: String) async throws -> Session {
-    try await SupabaseLoggerTaskLocal.$additionalContext.withValue(
-      merging: [
-        "refresh_id": .string(UUID().uuidString),
-        "refresh_token": .string(refreshToken),
-      ]
-    ) {
+    try await performRefresh(logContext: ["refresh_token": .string(refreshToken)]) { refreshToken }
+  }
+
+  func refreshVerifiedMFASession(_ context: SessionMutationContext) async throws -> Session {
+    let session = try await performRefresh(expectedUserID: context.session.user.id) {
+      try requireMFAContext(context).refreshToken
+    }
+    _ = try requireMFAContext(context)
+    guard session.user.id == context.session.user.id else { throw CancellationError() }
+    return session
+  }
+
+  private func performRefresh(
+    logContext: JSONObject = [:],
+    expectedUserID: UUID? = nil,
+    selectToken: () throws -> String
+  ) async throws -> Session {
+    var logContext = logContext
+    logContext["refresh_id"] = .string(UUID().uuidString)
+    return try await SupabaseLoggerTaskLocal.$additionalContext.withValue(merging: logContext) {
       try await trace(using: logger) {
+        // Select an owned token in the same actor turn that joins or registers
+        // the refresh, including after any ordinary same-epoch token rotation.
+        let refreshToken = try selectToken()
         if let inFlightRefresh,
           inFlightRefresh.epoch == sessionEpoch,
           inFlightRefresh.refreshToken == refreshToken
         {
+          if let expectedUserID {
+            self.inFlightRefresh?.expectedUserID = expectedUserID
+          }
           logger?.debug("Refresh already in flight")
           return try await inFlightRefresh.task.value
         }
@@ -155,6 +179,8 @@ private actor LiveSessionManager {
           operationID: operationID,
           epoch: epoch,
           refreshToken: refreshToken,
+          replacesCurrentSession: sessionStorage.get()?.refreshToken != refreshToken,
+          expectedUserID: expectedUserID,
           task: refreshTask
         )
 
@@ -233,13 +259,16 @@ private actor LiveSessionManager {
     return current
   }
 
-  func commitMFAVerification(_ response: Session, context: SessionMutationContext) throws {
+  func commitMFAVerification(
+    _ response: Session, context: SessionMutationContext
+  ) throws -> SessionMutationContext {
     _ = try requireMFAContext(context)
     guard response.user.id == context.session.user.id else {
       throw CancellationError()
     }
     update(response)
     eventEmitter.emit(.mfaChallengeVerified, session: response)
+    return SessionMutationContext(session: response, epoch: sessionEpoch)
   }
 
   func removeIfMutationOwned(_ context: SessionMutationContext) -> Bool {
@@ -307,10 +336,20 @@ private actor LiveSessionManager {
     operationID: UUID,
     epoch: UInt64
   ) throws -> Session {
-    guard ownsRefreshOperation(operationID: operationID, epoch: epoch) else {
+    guard ownsRefreshOperation(operationID: operationID, epoch: epoch),
+      let inFlightRefresh
+    else {
+      throw CancellationError()
+    }
+    if let expectedUserID = inFlightRefresh.expectedUserID, session.user.id != expectedUserID {
       throw CancellationError()
     }
 
+    if inFlightRefresh.replacesCurrentSession {
+      // Exchanging an explicit noncurrent token installs a different session.
+      // This includes the first commit of setSession with an expired token.
+      invalidateRefreshOperations()
+    }
     sessionStorage.store(session)
     eventEmitter.emit(.tokenRefreshed, session: session)
     return session

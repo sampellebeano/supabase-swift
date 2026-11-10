@@ -2,6 +2,12 @@ import Foundation
 
 /// Contains the full multi-factor authentication API.
 public struct AuthMFA: Sendable {
+  /// An opaque reference to the session installed by a successful MFA verification.
+  public struct VerifiedSession: Sendable {
+    fileprivate let clientID: AuthClientID
+    fileprivate let context: SessionMutationContext
+  }
+
   let clientID: AuthClientID
 
   var configuration: AuthClient.Configuration { Dependencies[clientID].configuration }
@@ -64,13 +70,13 @@ public struct AuthMFA: Sendable {
   @discardableResult
   public func verify(params: MFAVerifyParams) async throws -> AuthMFAVerifyResponse {
     let context = try await sessionManager.mfaContext()
-    return try await verify(params: params, context: context)
+    return try await verify(params: params, context: context).session
   }
 
   private func verify(
     params: MFAVerifyParams,
     context: SessionMutationContext
-  ) async throws -> AuthMFAVerifyResponse {
+  ) async throws -> SessionMutationContext {
     let response: AuthMFAVerifyResponse = try await execute(
       HTTPRequest(
         url: configuration.url.appendingPathComponent("factors/\(params.factorId)/verify"),
@@ -80,8 +86,7 @@ public struct AuthMFA: Sendable {
       context: context
     ).decoded(decoder: decoder)
 
-    try await sessionManager.commitMFAVerification(response, context)
-    return response
+    return try await sessionManager.commitMFAVerification(response, context)
   }
 
   private func execute(_ request: HTTPRequest, context: SessionMutationContext) async throws
@@ -130,17 +135,36 @@ public struct AuthMFA: Sendable {
   public func challengeAndVerify(
     params: MFAChallengeAndVerifyParams
   ) async throws -> AuthMFAVerifyResponse {
+    try await challengeAndVerifyForRefresh(params: params).context.session
+  }
+
+  /// Challenges and verifies a factor, returning a reference for a forced refresh of the
+  /// verified session. The reference becomes invalid when the session is replaced or removed.
+  public func challengeAndVerifyForRefresh(
+    params: MFAChallengeAndVerifyParams
+  ) async throws -> VerifiedSession {
     let context = try await sessionManager.mfaContext()
     let response = try await challenge(
       params: MFAChallengeParams(factorId: params.factorId),
       context: context
     )
-    return try await verify(
+    let verified = try await verify(
       params: MFAVerifyParams(
         factorId: params.factorId, challengeId: response.id, code: params.code
       ),
       context: context
     )
+    return VerifiedSession(clientID: clientID, context: verified)
+  }
+
+  /// Forces a refresh for the verified session and reports assurance from that refresh response.
+  /// Throws `CancellationError` if the reference belongs to another client or a replaced session.
+  public func refreshVerifiedSession(
+    _ verification: VerifiedSession
+  ) async throws -> AuthMFAGetAuthenticatorAssuranceLevelResponse {
+    guard verification.clientID == clientID else { throw CancellationError() }
+    let session = try await sessionManager.refreshVerifiedMFASession(verification.context)
+    return assurance(for: session)
   }
 
   /// Returns the list of MFA factors enabled for this user.
@@ -165,33 +189,7 @@ public struct AuthMFA: Sendable {
     -> AuthMFAGetAuthenticatorAssuranceLevelResponse
   {
     do {
-      let session = try await sessionManager.session()
-      let payload = JWT.decodePayload(session.accessToken)
-
-      var currentLevel: AuthenticatorAssuranceLevels?
-
-      if let aal = payload?["aal"] as? AuthenticatorAssuranceLevels {
-        currentLevel = aal
-      }
-
-      var nextLevel = currentLevel
-
-      let verifiedFactors = session.user.factors?.filter { $0.status == .verified } ?? []
-      if !verifiedFactors.isEmpty {
-        nextLevel = "aal2"
-      }
-
-      var currentAuthenticationMethods: [AMREntry] = []
-
-      if let amr = payload?["amr"] as? [Any] {
-        currentAuthenticationMethods = amr.compactMap(AMREntry.init(value:))
-      }
-
-      return AuthMFAGetAuthenticatorAssuranceLevelResponse(
-        currentLevel: currentLevel,
-        nextLevel: nextLevel,
-        currentAuthenticationMethods: currentAuthenticationMethods
-      )
+      return assurance(for: try await sessionManager.session())
     } catch AuthError.sessionMissing {
       return AuthMFAGetAuthenticatorAssuranceLevelResponse(
         currentLevel: nil,
@@ -199,5 +197,34 @@ public struct AuthMFA: Sendable {
         currentAuthenticationMethods: []
       )
     }
+  }
+
+  private func assurance(for session: Session) -> AuthMFAGetAuthenticatorAssuranceLevelResponse {
+    let payload = JWT.decodePayload(session.accessToken)
+
+    var currentLevel: AuthenticatorAssuranceLevels?
+
+    if let aal = payload?["aal"] as? AuthenticatorAssuranceLevels {
+      currentLevel = aal
+    }
+
+    var nextLevel = currentLevel
+
+    let verifiedFactors = session.user.factors?.filter { $0.status == .verified } ?? []
+    if !verifiedFactors.isEmpty {
+      nextLevel = "aal2"
+    }
+
+    var currentAuthenticationMethods: [AMREntry] = []
+
+    if let amr = payload?["amr"] as? [Any] {
+      currentAuthenticationMethods = amr.compactMap(AMREntry.init(value:))
+    }
+
+    return AuthMFAGetAuthenticatorAssuranceLevelResponse(
+      currentLevel: currentLevel,
+      nextLevel: nextLevel,
+      currentAuthenticationMethods: currentAuthenticationMethods
+    )
   }
 }
